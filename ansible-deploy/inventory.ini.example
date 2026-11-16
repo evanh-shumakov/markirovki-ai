@@ -1,0 +1,2 @@
+[production]
+80.247.210.130 ansible_user=root

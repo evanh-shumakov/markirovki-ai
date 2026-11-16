@@ -1,0 +1,376 @@
+---
+- name: Deploy Markirovki to production
+
+  hosts: production
+
+  vars_files:
+    - group_vars/production.yml
+
+  tasks:
+    - name: Update APT Package Manager repositories cache
+      become: true
+      apt:
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Upgrade installed packages
+      become: true
+      apt:
+        upgrade: dist
+        lock_timeout: 300
+
+    - name: Install PHP and required extensions
+      apt:
+        name:
+          - "php{{ php_version }}"
+          - "php{{ php_version }}-fpm"
+          - "php{{ php_version }}-cli"
+          - "php{{ php_version }}-pgsql"
+          - "php{{ php_version }}-mbstring"
+          - "php{{ php_version }}-xml"
+          - "php{{ php_version }}-curl"
+          - "php{{ php_version }}-zip"
+          - "php{{ php_version }}-gd"
+          - "php{{ php_version }}-bcmath"
+          - "php{{ php_version }}-intl"
+        state: present
+        update_cache: yes
+
+    - name: Switch default PHP CLI version to 8.5
+      community.general.alternatives:
+        name: php
+        path: /usr/bin/php8.5
+        state: selected
+      become: true
+
+    - name: Install utilities
+      apt:
+        name:
+          - nginx
+          - git
+          - zip
+          - unzip
+          - acl
+        state: present
+        update_cache: yes
+
+    - name: Download and install Composer
+      shell: |
+        curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+      args:
+        creates: /usr/local/bin/composer
+
+    - name: Ensure deploy user exists
+      user:
+        name: "{{ deploy_user }}"
+        create_home: yes
+        shell: /bin/bash
+        groups: www-data
+        append: yes
+        state: present
+
+    - name: Create .ssh directory in deploy user home
+      file:
+        path: "{{ deploy_user_home }}/.ssh"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: '0700'
+
+    - name: Deploy SSH private key for Git
+      copy:
+        src: ~/.ssh/markirovki_deploy
+        dest: "{{ deploy_user_home }}/.ssh/id_ed25519"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: '0600'
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: '0755'
+
+    - name: Mark application directory as safe for Git (fixes dubious ownership)
+      command: git config --global --add safe.directory "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      changed_when: false
+
+    - name: Clone or update Laravel application
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_branch }}"
+        force: yes
+        key_file: "{{ deploy_user_home }}/.ssh/id_ed25519"
+        accept_hostkey: yes
+      become_user: "{{ deploy_user }}"
+      register: git_result
+      notify: restart php-fpm
+      tags:
+        -deploy
+
+    - name: Check if .env exists on server
+      stat:
+        path: "{{ app_dir }}/.env"
+      register: env_file_stat
+      become_user: "{{ deploy_user }}"
+
+    - name: Deploy Laravel environment file
+      template:
+        src: env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: '0600'
+        force: yes
+      when: "not env_file_stat.stat.exists"
+      notify: restart php-fpm
+
+    - name: Read .env content from server
+      slurp:
+        src: "{{ app_dir }}/.env"
+      register: env_file_content
+      become_user: "{{ deploy_user }}"
+      when: env_file_stat.stat.exists
+
+    - name: Install Composer dependencies (production mode)
+      composer:
+        command: install
+        working_dir: "{{ app_dir }}"
+        no_dev: yes
+        optimize_autoloader: yes
+      become_user: "{{ deploy_user }}"
+      when: git_result.changed
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: "1"
+
+#    - name: Install Node.js and npm
+#      apt:
+#        name:
+#          - nodejs
+#          - npm
+#        state: present
+
+    - name: Install Node.js 22 using official NodeSource script
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+      become: yes
+
+    - name: Install Node.js and npm
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Install frontend dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present   # runs npm install
+
+    - name: Build frontend assets for production
+      command: npm run build
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      environment:
+        NODE_ENV: production
+
+    - name: Install PostgreSQL server
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+
+    - name: Install psycopg2 Python library (required for Ansible PostgreSQL modules)
+      apt:
+        name: python3-psycopg2
+        state: present
+        update_cache: yes
+
+    - name: Start and enable PostgreSQL
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Create PostgreSQL user/role
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+      become: yes
+      become_user: postgres
+
+    - name: Create PostgreSQL database and user for Markirovki
+      postgresql_db:
+        name: "{{ db_name }}"
+        owner: "{{ db_user }}"
+        state: present
+      become: yes
+      become_user: postgres
+
+    - name: Grant privileges to the database user
+      postgresql_user:
+        db: "{{ db_name }}"
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        priv: "ALL"
+        state: present
+      become: yes
+      become_user: postgres
+
+    - name: Set proper permissions on storage directory
+      file:
+        path: "{{ app_dir }}/storage"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0775'
+        recurse: yes
+      changed_when: false
+
+    - name: Set proper permissions on bootstrap/cache
+      file:
+        path: "{{ app_dir }}/bootstrap/cache"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0775'
+        recurse: yes
+
+    - name: Generate application key if not set
+      shell: php artisan key:generate --force --no-ansi
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      when: >
+        (not env_file_stat.stat.exists)
+        or
+        (
+          not
+            env_content.content
+            | default('')
+            | b64decode
+            | regex_search('^APP_KEY=[^#].+', multiline=True)
+        )
+
+    - name: Run Laravel database migrations
+      shell: php artisan migrate --force
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+
+    - name: Cache Laravel configuration
+      shell: php artisan config:cache
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      when: git_result.changed
+
+    - name: Cache Laravel routes
+      shell: php artisan route:cache
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      when: git_result.changed
+
+    - name: Cache Laravel views
+      shell: php artisan view:cache
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ deploy_user }}"
+      when: git_result.changed
+
+    - name: Create storage symlink for public files
+      shell: php artisan storage:link
+      args:
+        chdir: "{{ app_dir }}"
+        creates: "{{ app_dir }}/public/storage"
+      become_user: "{{ deploy_user }}"
+
+    - name: Configure PHP-FPM pool settings
+      lineinfile:
+        path: "/etc/php/{{ php_version }}/fpm/pool.d/www.conf"
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^pm.max_children', line: 'pm.max_children = 50' }
+        - { regexp: '^pm.start_servers', line: 'pm.start_servers = 5' }
+        - { regexp: '^pm.min_spare_servers', line: 'pm.min_spare_servers = 5' }
+        - { regexp: '^pm.max_spare_servers', line: 'pm.max_spare_servers = 35' }
+      notify: restart php-fpm
+
+    - name: Ensure Nginx site directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/nginx/sites-available
+        - /etc/nginx/sites-enabled
+      become: true
+
+    - name: Deploy Nginx configuration
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/{{ app_name }}.conf
+        mode: '0644'
+      notify: reload nginx
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ app_name }}.conf
+        dest: /etc/nginx/sites-enabled/{{ app_name }}.conf
+        state: link
+      notify: reload nginx
+
+#    - name: Remove default Nginx site
+#      file:
+#        path: /etc/nginx/sites-enabled/default
+#        state: absent
+#      notify: reload nginx
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/conf.d/{{ ansible_default_ipv4.address }}.conf
+        state: absent
+      notify: reload nginx
+
+    - name: Ensure nginx includes sites-enabled directory
+      ansible.builtin.lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^\s*include\s+/etc/nginx/sites-enabled/\*\.conf;'
+        line: "                         include /etc/nginx/sites-enabled/*.conf;"
+        insertafter: '^\s*include\s+/etc/nginx/conf.d/domains/\*\.conf;'
+        state: present
+      notify: reload nginx
+      become: true
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: restart php-fpm
+      systemd:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: restart queue worker
+      systemd:
+        name: "{{ app_name }}-worker"
+        state: restarted

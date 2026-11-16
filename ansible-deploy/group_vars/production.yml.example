@@ -1,0 +1,24 @@
+---
+environment_type: production
+app_name: markirovki
+app_user: www-data
+deploy_user: deploy
+deploy_user_home: "/home/{{ deploy_user }}"
+app_dir: /var/www/markirovki
+app_repo: git@github.com:evanh-shumakov/markirovki-ai.git
+app_branch: main
+parent_domain: xn--80aafghkx0aikceno.xn--p1ai # продразверстка.рф - для редиректа на поддомен
+server_name: xn--80aerbhcjtpc.xn--80aafghkx0aikceno.xn--p1ai # маркировки.продразверстка.рф
+php_version: "8.5"
+db_connection: pgsql
+db_host: 127.0.0.1
+db_port: 5432
+db_name: пропишите ваше имя базы данных
+db_user: пропишите ваше имя пользователя
+db_password: пропишите ваш пароль этого пользователя для этой базы данных
+
+#queue_connection: redis
+#redis_host: localhost
+
+#vault_app_key: base64:jm8HAlu/wMwRWWuX9/GnyXzzvfVC7eyiYYNgcC2K0Gw=
+#vault_db_password: password
